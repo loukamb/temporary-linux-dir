@@ -1,0 +1,4 @@
+for systemd:
+    sudo pacman -S --needed acl audit bash-completion bpf clang cryptsetup curl docbook-xsl git gnutls gperf intltool iptables kexec-tools kmod lib32-gcc-libs libarchive libbpf libcap libelf libfido2 libgcrypt libidn2 libmicrohttpd libpwquality libseccomp libxcrypt libxkbcommon libxslt linux-api-headers linux-headers llvm lz4 meson p11-kit pam pcre2 python-jinja python-lxml python-pefile python-pyelftools qrencode quota-tools rsync shadow systemd tpm2-tss util-linux xz
+
+mtools
