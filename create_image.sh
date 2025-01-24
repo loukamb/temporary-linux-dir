@@ -47,13 +47,14 @@ check_requirements() {
         "grub-mkrescue"
         "gperf"
         "xorriso"
-        "flex" 
+        "flex"
         "bison"
         "m4"
         "perl"
         "pkg-config"
         "gettext"
         "mtools"
+        "dracut"
     )
 
     # Arch package names for development libraries
@@ -115,6 +116,7 @@ SYSROOT="$WORKDIR/sysroot"
 # Component versions
 KERNEL_VERSION="6.6.72"
 SYSTEMD_VERSION="257.2"
+DRACUT_VERSION="059"
 BASH_VERSION="5.2.21"
 LUA_VERSION="5.4.7"
 GNU_BINUTILS_VERSION="2.41"
@@ -129,9 +131,9 @@ mkdir -p "$SYSROOT"/{bin,sbin,lib,lib64,usr,etc,var,boot,proc,sys,dev,run,tmp}
 download_sources() {
     # Create cache directory if it doesn't exist
     mkdir -p "$SOURCES_CACHE"
-    
+
     cd "$SOURCES_CACHE"
-    
+
     # Function to download only if not in cache
     download_if_missing() {
         local url="$1"
@@ -143,23 +145,26 @@ download_sources() {
             echo "Using cached $filename"
         fi
     }
-    
+
     # Download kernel
     download_if_missing "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KERNEL_VERSION.tar.xz"
-    
+
     # Download systemd
     download_if_missing "https://github.com/systemd/systemd/archive/v$SYSTEMD_VERSION.tar.gz"
-    
+
+    # Download initramfs bullshit
+    download_if_missing "https://github.com/dracutdevs/dracut/archive/refs/tags/${DRACUT_VERSION}.tar.gz"
+
     # Download GNU components
     download_if_missing "https://ftp.gnu.org/gnu/binutils/binutils-$GNU_BINUTILS_VERSION.tar.xz"
     download_if_missing "https://ftp.gnu.org/gnu/gcc/gcc-$GNU_GCC_VERSION/gcc-$GNU_GCC_VERSION.tar.xz"
     download_if_missing "https://ftp.gnu.org/gnu/glibc/glibc-$GNU_GLIBC_VERSION.tar.xz"
     download_if_missing "https://ftp.gnu.org/gnu/coreutils/coreutils-$GNU_COREUTILS_VERSION.tar.xz"
     download_if_missing "https://ftp.gnu.org/gnu/bash/bash-$BASH_VERSION.tar.gz"
-    
+
     # Download Lua
     download_if_missing "https://www.lua.org/ftp/lua-$LUA_VERSION.tar.gz"
-    
+
     # Copy cached files to sources directory
     mkdir -p "$SOURCES_DIR"
     cp -u *.tar.* "$SOURCES_DIR/"
@@ -167,22 +172,31 @@ download_sources() {
 
 extract_sources() {
     cd "$SOURCES_DIR"
-    
-    # Extract all sources
+
+    # Extract archives only if their directory doesn't exist
     for archive in *.tar.*; do
-        tar xf "$archive"
+        # Get directory name by removing extension(s)
+        dir_name=$(echo "$archive" | sed -E 's/\.tar\.(gz|xz|bz2)$//')
+
+        if [ ! -d "$dir_name" ]; then
+            echo "Extracting $archive..."
+            tar xf "$archive"
+        else
+            echo "Skipping extraction of $archive - directory $dir_name already exists"
+        fi
     done
 }
 
 build_kernel() {
     cd "$SOURCES_DIR/linux-$KERNEL_VERSION"
-    
+
     # Copy the provided .config
     cp "$WORKDIR/../.config" .
 
     # Build kernel
     make -s V=0 -j$(nproc) 2>&1 | grep -E "error|Error|ERROR|warning|Warning|WARNING"
-    
+    # make -j$(nproc)
+
     # Install kernel and modules
     make INSTALL_MOD_PATH="$SYSROOT" modules_install
     cp arch/x86_64/boot/bzImage "$SYSROOT/boot/vmlinuz"
@@ -190,7 +204,7 @@ build_kernel() {
 
 build_systemd() {
     cd "$SOURCES_DIR/systemd-$SYSTEMD_VERSION"
-    
+
     mkdir build && cd build
     meson setup \
         --prefix=/usr \
@@ -201,7 +215,7 @@ build_systemd() {
         -Defi=true \
         -Dbootloader=enabled \
         ..
-    
+
     ninja
     DESTDIR="$SYSROOT" ninja install
 }
@@ -211,16 +225,16 @@ build_bootloader() {
     mkdir -p "$SYSROOT/boot/efi/EFI/BOOT"
     cp "$SYSROOT/usr/lib/systemd/boot/efi/systemd-bootx64.efi" \
         "$SYSROOT/boot/efi/EFI/BOOT/BOOTX64.EFI"
-    
+
     # Create basic loader configuration
     mkdir -p "$SYSROOT/boot/loader/entries"
-    cat > "$SYSROOT/boot/loader/loader.conf" << EOF
+    cat >"$SYSROOT/boot/loader/loader.conf" <<EOF
 default arch
 timeout 3
 editor 0
 EOF
 
-    cat > "$SYSROOT/boot/loader/entries/arch.conf" << EOF
+    cat >"$SYSROOT/boot/loader/entries/arch.conf" <<EOF
 title Linux
 linux /vmlinuz
 initrd /initramfs.img
@@ -229,57 +243,70 @@ EOF
 }
 
 build_initramfs() {
-    # Install mkinitcpio
+    echo "Building and installing dracut..."
+
+    # Extract and build dracut
     cd "$SOURCES_DIR"
-    if [ ! -d "mkinitcpio" ]; then
-        git clone https://github.com/archlinux/mkinitcpio.git
-    fi
-    cd mkinitcpio
-    
-    # Build and install with meson
-    meson setup build \
+    tar xf "${DRACUT_VERSION}.tar.gz"
+    cd "dracut-${DRACUT_VERSION}"
+
+    # Configure and build
+    ./configure \
         --prefix=/usr \
-        --sysconfdir=/etc
-    meson compile -C build
-    DESTDIR="$SYSROOT" meson install -C build
-    
-    # Configure mkinitcpio
-    cat > "$SYSROOT/etc/mkinitcpio.conf" << EOF
-MODULES=(ext4)
-BINARIES=()
-FILES=()
-HOOKS=(base udev memdisk autodetect modconf block filesystems keyboard)
+        --sysconfdir=/etc \
+        --libdir=/usr/lib \
+        --systemdsystemunitdir=/usr/lib/systemd/system
+
+    make -j$(nproc)
+    make DESTDIR="$SYSROOT" install
+
+    # Create necessary directories
+    mkdir -p "$SYSROOT"/{etc/dracut.conf.d,var/tmp,run,sys,proc,dev}
+    chmod 1777 "$SYSROOT/var/tmp"
+
+    # Configure dracut
+    cat >"$SYSROOT/etc/dracut.conf.d/01-basic.conf" <<EOF
+# Add base drivers and filesystems
+add_drivers+=" ext4 "
+add_dracutmodules+=" base systemd kernel-modules fs-lib "
+force_drivers+=" brd "
+
+# Include basic system utilities
+install_items+=" /bin/sh /bin/bash /bin/mount /bin/umount "
+
+# Configure systemd as init
+systemd_enable="yes"
 EOF
 
-    # The kernel modules should be in $SYSROOT/lib/modules/$KERNEL_VERSION
-    # Let's verify the directory exists and has the correct permissions
-    if [ ! -d "$SYSROOT/lib/modules/$KERNEL_VERSION" ]; then
-        echo "Error: Kernel modules directory not found!"
-        echo "Expected: $SYSROOT/lib/modules/$KERNEL_VERSION"
-        ls -la "$SYSROOT/lib/modules"
+    # Generate initramfs
+    "$SYSROOT/usr/bin/dracut" \
+        --force \
+        --no-compress \
+        --kver "$KERNEL_VERSION" \
+        --modules "base systemd kernel-modules fs-lib" \
+        --drivers "ext4 brd" \
+        --sysroot "$SYSROOT" \
+        --no-hostonly \
+        --add-drivers "ext4 brd" \
+        "$SYSROOT/boot/initramfs.img"
+
+    if [ ! -f "$SYSROOT/boot/initramfs.img" ]; then
+        echo "Error: Failed to generate initramfs!"
         exit 1
     fi
-
-        # Generate initramfs with correct paths
-    KERNEL_MODULES_DIR="$SYSROOT/lib/modules/$KERNEL_VERSION" \
-    mkinitcpio \
-        -k "$KERNEL_VERSION" \
-        -g "$SYSROOT/boot/initramfs.img" \
-        -r "$SYSROOT" \
-        -c "$SYSROOT/etc/mkinitcpio.conf"
 }
 
 build_gnu_userland() {
     # Build and install GNU components
     cd "$SOURCES_DIR"
-    
+
     # Build binutils first
     cd "binutils-$GNU_BINUTILS_VERSION"
     ./configure --prefix=/usr
     make -j$(nproc)
     make DESTDIR="$SYSROOT" install
     cd ..
-    
+
     # Build GCC
     # TODO: Re-enable this when I don't wanna recompile EVERYTHING
     : "
@@ -291,7 +318,7 @@ build_gnu_userland() {
     make DESTDIR="$SYSROOT" install
     cd ..
     "
-    
+
     # Build glibc
     cd "glibc-$GNU_GLIBC_VERSION"
     mkdir build && cd build
@@ -299,7 +326,7 @@ build_gnu_userland() {
     make -j$(nproc)
     make DESTDIR="$SYSROOT" install
     cd ../..
-    
+
     # Build coreutils
     cd "coreutils-$GNU_COREUTILS_VERSION"
     ./configure --prefix=/usr
@@ -313,7 +340,7 @@ build_bash() {
     ./configure --prefix=/usr
     make -j$(nproc)
     make DESTDIR="$SYSROOT" install
-    
+
     # Set bash as default shell
     ln -sf bash "$SYSROOT/bin/sh"
 }
@@ -331,9 +358,9 @@ create_iso() {
     # Create ISO directory structure
     mkdir -p "$WORKDIR/iso/boot/grub"
     cp -r "$SYSROOT"/* "$WORKDIR/iso/"
-    
+
     # Generate GRUB configuration
-    cat > "$WORKDIR/iso/boot/grub/grub.cfg" << EOF
+    cat >"$WORKDIR/iso/boot/grub/grub.cfg" <<EOF
 set timeout=5
 set default=0
 
@@ -342,20 +369,20 @@ menuentry "Seed Linux" {
     initrd /boot/initramfs.img
 }
 EOF
-    
+
     # Create ISO
     grub-mkrescue -o "$OUTPUT_DIR/seedlinux.iso" "$WORKDIR/iso"
 }
 
 main() {
     check_requirements
-    
+
     # Clean up sysroot
     echo "Cleaning up sysroot..."
     rm -rf "$SYSROOT"
     mkdir -p "$SYSROOT"/{bin,sbin,lib,lib64,usr,etc,var,boot,proc,sys,dev,run,tmp}
     chmod 1777 "$SYSROOT/tmp"
-    
+
     # Clean up sources directory but keep cache
     echo "Cleaning up sources directory..."
     rm -rf "$SOURCES_DIR"
@@ -370,7 +397,7 @@ main() {
     build_bash
     build_lua
     create_iso
-    
+
     echo "Build completed successfully!"
     echo "ISO image is available at: $OUTPUT_DIR/seedlinux.iso"
 }
