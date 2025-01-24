@@ -195,7 +195,6 @@ build_kernel() {
 
     # Build kernel
     make -s V=0 -j$(nproc) 2>&1 | grep -E "error|Error|ERROR|warning|Warning|WARNING"
-    # make -j$(nproc)
 
     # Install kernel and modules
     make INSTALL_MOD_PATH="$SYSROOT" modules_install
@@ -205,19 +204,26 @@ build_kernel() {
 build_systemd() {
     cd "$SOURCES_DIR/systemd-$SYSTEMD_VERSION"
 
-    mkdir build && cd build
+    mkdir -p build && cd build
     meson setup \
         --prefix=/usr \
         --sysconfdir=/etc \
         --localstatedir=/var \
-        -Drootprefix="" \
+        -Drootprefix="/usr" \
         -Dsplit-usr=false \
         -Defi=true \
         -Dbootloader=enabled \
+        -Dsysvinit-path=/etc/init.d \
+        -Dpamlibdir=/usr/lib/security \
+        -Drootlibdir=/usr/lib \
         ..
 
     ninja
     DESTDIR="$SYSROOT" ninja install
+
+    # Create necessary symlinks
+    mkdir -p "$SYSROOT/sbin"
+    ln -sf ../usr/lib/systemd/systemd "$SYSROOT/sbin/init"
 }
 
 build_bootloader() {
@@ -242,8 +248,27 @@ options root=/dev/ram0 rw
 EOF
 }
 
+check_critical_files() {
+    local files=(
+        "$SYSROOT/bin/sh"
+        "$SYSROOT/usr/lib/systemd/systemd"
+        "$SYSROOT/usr/lib/systemd/system"
+    )
+
+    for file in "${files[@]}"; do
+        if [ ! -e "$file" ]; then
+            echo "Error: Critical file/directory missing: $file"
+            exit 1
+        fi
+    done
+}
+
 build_initramfs() {
     echo "Building and installing dracut..."
+
+    # Clean up any existing systemd service directories to prevent symlink conflicts
+    rm -rf "$SYSROOT/usr/lib/systemd/system/sysinit.target.wants"
+    rm -rf "$SYSROOT/usr/lib/systemd/system/initrd.target.wants"
 
     # Extract and build dracut
     cd "$SOURCES_DIR"
@@ -272,11 +297,15 @@ add_dracutmodules+=" base systemd kernel-modules fs-lib "
 force_drivers+=" brd "
 
 # Include basic system utilities
-install_items+=" /bin/sh /bin/bash /bin/mount /bin/umount "
+install_items+=" /bin/sh /bin/bash /bin/mount /bin/umount /usr/lib/systemd/systemd "
 
 # Configure systemd as init
 systemd_enable="yes"
+systemd_path="/usr/lib/systemd/systemd"
 EOF
+
+    # Check for critical files before running dracut
+    check_critical_files
 
     # Generate initramfs
     "$SYSROOT/usr/bin/dracut" \
@@ -288,6 +317,7 @@ EOF
         --sysroot "$SYSROOT" \
         --no-hostonly \
         --add-drivers "ext4 brd" \
+        --include "$SYSROOT/usr/lib/systemd/systemd" "$SYSROOT/usr/lib/systemd/systemd" \
         "$SYSROOT/boot/initramfs.img"
 
     if [ ! -f "$SYSROOT/boot/initramfs.img" ]; then
@@ -321,7 +351,7 @@ build_gnu_userland() {
 
     # Build glibc
     cd "glibc-$GNU_GLIBC_VERSION"
-    mkdir build && cd build
+    mkdir -p build && cd build
     ../configure --prefix=/usr
     make -j$(nproc)
     make DESTDIR="$SYSROOT" install
@@ -342,7 +372,7 @@ build_bash() {
     make DESTDIR="$SYSROOT" install
 
     # Set bash as default shell
-    ln -sf bash "$SYSROOT/bin/sh"
+    ln -sf "$SYSROOT/usr/bin/bash" "$SYSROOT/bin/sh"
 }
 
 build_lua() {
@@ -389,12 +419,12 @@ main() {
     mkdir -p "$SOURCES_DIR"
     download_sources
     extract_sources
-    build_kernel
-    build_systemd
-    build_bootloader
-    build_initramfs
     build_gnu_userland
     build_bash
+    build_systemd
+    build_kernel
+    build_bootloader
+    build_initramfs
     build_lua
     create_iso
 
